@@ -1,11 +1,11 @@
 import os
 import re
+import time
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
 
 app = Flask(__name__)
-
 SYSTEM_PROMPT = """
 You are an expert system administrator debugging terminal errors.
 Analyze the provided error log and the user's OS/Environment context.
@@ -18,52 +18,55 @@ Respond strictly in two parts:
    - For missing packages/ports: Provide standard terminal fixes (pip, kill, etc).
    - For source code syntax errors: Do NOT suggest opening notepad, nano, or vim. You must provide a command that completely overwrites the buggy file with the corrected code.
    - Example for Windows/Linux: echo '#include <stdio.h>...' > filename.c
-"""
+"""	
 
-# Added GET method so you can test if the server is alive from your browser
 @app.route('/api/diagnose', methods=['POST', 'GET'])
 def diagnose():
     if request.method == 'GET':
-        return jsonify({"status": "API is running. Send POST requests to use the engine."}), 200
+        return jsonify({"status": "API is running."}), 200
 
     try:
-        # 1. Safe Key Check
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            return jsonify({"error": "Server Error: GEMINI_API_KEY is missing in Vercel settings."}), 500
+            return jsonify({"error": "Missing GEMINI_API_KEY"}), 500
             
         client = genai.Client(api_key=api_key)
-        
-        # 2. Safe JSON Parsing
         data = request.get_json(silent=True) or {}
-        os_context = data.get('context', 'Unknown OS')
-        error_text = data.get('error', 'No error provided')
         
-        prompt = f"Environment Context:\n{os_context}\n\nError Output:\n{error_text}"
+        prompt = f"Environment Context:\n{data.get('context', '')}\n\nError Output:\n{data.get('error', '')}"
         
-        # 3. API Call
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.2,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-            )
-        )
+        # --- NEW RETRY LOGIC ---
+        MAX_RETRIES = 3
+        response = None
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model='gemini-3.5-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.2,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+                    )
+                )
+                break  # If successful, break out of the loop
+            except Exception as e:
+                if "503" in str(e) and attempt < MAX_RETRIES - 1:
+                    time.sleep(1.5 ** attempt) # Sleep 1s, then 1.5s
+                    continue
+                else:
+                    raise e # If it's not a 503 or we are out of retries, crash normally
+
+        # -----------------------
         
         raw_text = response.text.strip()
-        
-        # 4. Regex Parsing
         match = re.search(r'<EXEC>(.*?)</EXEC>', raw_text, re.DOTALL)
-        extracted_cmd = match.group(1).strip() if match else None
-        clean_explanation = re.sub(r'<EXEC>.*?</EXEC>', '', raw_text, flags=re.DOTALL).strip()
         
         return jsonify({
-            "explanation": clean_explanation,
-            "command": extracted_cmd
+            "explanation": re.sub(r'<EXEC>.*?</EXEC>', '', raw_text, flags=re.DOTALL).strip(),
+            "command": match.group(1).strip() if match else None
         })
         
     except Exception as e:
-        # If anything breaks, return the exact Python error string to the terminal
-        return jsonify({"error": f"Python Exception: {str(e)}"}), 500
+        return jsonify({"error": f"Server Error: {str(e)}"}), 500
