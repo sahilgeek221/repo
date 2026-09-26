@@ -5,7 +5,6 @@ from google import genai
 from google.genai import types
 
 app = Flask(__name__)
-client = genai.Client() # Vercel will inject your GEMINI_API_KEY environment variable here
 
 SYSTEM_PROMPT = """
 You are an expert system administrator debugging terminal errors.
@@ -15,15 +14,28 @@ Respond strictly in two parts:
 2. If a terminal command can fix it, provide the exact command wrapped in <EXEC> tags native to the user's OS.
 """
 
-@app.route('/api/diagnose', methods=['POST'])
+# Added GET method so you can test if the server is alive from your browser
+@app.route('/api/diagnose', methods=['POST', 'GET'])
 def diagnose():
-    data = request.get_json()
-    os_context = data.get('context', '')
-    error_text = data.get('error', '')
-    
-    prompt = f"Environment Context:\n{os_context}\n\nError Output:\n{error_text}"
-    
+    if request.method == 'GET':
+        return jsonify({"status": "API is running. Send POST requests to use the engine."}), 200
+
     try:
+        # 1. Safe Key Check
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return jsonify({"error": "Server Error: GEMINI_API_KEY is missing in Vercel settings."}), 500
+            
+        client = genai.Client(api_key=api_key)
+        
+        # 2. Safe JSON Parsing
+        data = request.get_json(silent=True) or {}
+        os_context = data.get('context', 'Unknown OS')
+        error_text = data.get('error', 'No error provided')
+        
+        prompt = f"Environment Context:\n{os_context}\n\nError Output:\n{error_text}"
+        
+        # 3. API Call
         response = client.models.generate_content(
             model='gemini-3.5-flash',
             contents=prompt,
@@ -33,9 +45,10 @@ def diagnose():
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             )
         )
+        
         raw_text = response.text.strip()
         
-        # We parse the regex on the server so the CLI receives perfectly clean data
+        # 4. Regex Parsing
         match = re.search(r'<EXEC>(.*?)</EXEC>', raw_text, re.DOTALL)
         extracted_cmd = match.group(1).strip() if match else None
         clean_explanation = re.sub(r'<EXEC>.*?</EXEC>', '', raw_text, flags=re.DOTALL).strip()
@@ -44,5 +57,7 @@ def diagnose():
             "explanation": clean_explanation,
             "command": extracted_cmd
         })
+        
     except Exception as e:
-        return jsonify({"error": f"Server Error: {str(e)}"}), 500
+        # If anything breaks, return the exact Python error string to the terminal
+        return jsonify({"error": f"Python Exception: {str(e)}"}), 500
